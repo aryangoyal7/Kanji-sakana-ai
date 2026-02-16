@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -96,27 +97,93 @@ def collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     }
 
 
+def extract_parameters_from_object(obj: Any) -> list[Parameter]:
+    params: list[Parameter] = []
+    seen_param_ids: set[int] = set()
+    seen_obj_ids: set[int] = set()
+
+    def add_param(param: Parameter) -> None:
+        if id(param) in seen_param_ids:
+            return
+        seen_param_ids.add(id(param))
+        params.append(param)
+
+    def walk(node: Any) -> None:
+        node_id = id(node)
+        if node_id in seen_obj_ids:
+            return
+        seen_obj_ids.add(node_id)
+
+        if isinstance(node, Parameter):
+            add_param(node)
+            return
+
+        if isinstance(node, torch.nn.Module):
+            for p in node.parameters():
+                add_param(p)
+            return
+
+        if isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+            return
+
+        if isinstance(node, (list, tuple, set)):
+            for v in node:
+                walk(v)
+            return
+
+        if hasattr(node, "__dict__"):
+            for v in vars(node).values():
+                walk(v)
+
+    walk(obj)
+    return params
+
+
 def build_lora_attn_processor(hidden_size: int, cross_attention_dim: int | None, rank: int):
     # Diffusers changed LoRAAttnProcessor constructor across versions.
-    for ctor in (
-        lambda: LoRAAttnProcessor(
-            hidden_size=hidden_size,
-            cross_attention_dim=cross_attention_dim,
-            rank=rank,
-        ),
-        lambda: LoRAAttnProcessor(hidden_size, cross_attention_dim, rank),
-        lambda: LoRAAttnProcessor(hidden_size, cross_attention_dim),
-        lambda: LoRAAttnProcessor(rank),
-        lambda: LoRAAttnProcessor(),
-    ):
+    sig = inspect.signature(LoRAAttnProcessor.__init__)
+    param_names = set(sig.parameters.keys())
+
+    kw = {}
+    if "hidden_size" in param_names:
+        kw["hidden_size"] = hidden_size
+    if "cross_attention_dim" in param_names:
+        kw["cross_attention_dim"] = cross_attention_dim
+    if "rank" in param_names:
+        kw["rank"] = rank
+    elif "r" in param_names:
+        kw["r"] = rank
+    if "network_alpha" in param_names:
+        kw["network_alpha"] = rank
+    elif "lora_alpha" in param_names:
+        kw["lora_alpha"] = rank
+
+    constructors = []
+    if kw:
+        constructors.append(lambda: LoRAAttnProcessor(**kw))
+
+    constructors.extend(
+        [
+            lambda: LoRAAttnProcessor(hidden_size, cross_attention_dim, rank),
+            lambda: LoRAAttnProcessor(cross_attention_dim, hidden_size, rank),
+            lambda: LoRAAttnProcessor(hidden_size, cross_attention_dim),
+            lambda: LoRAAttnProcessor(cross_attention_dim, hidden_size),
+        ]
+    )
+
+    for ctor in constructors:
         try:
-            return ctor()
+            processor = ctor()
+            if extract_parameters_from_object(processor):
+                return processor
         except TypeError:
             continue
 
     raise TypeError(
-        "Could not initialize LoRAAttnProcessor with this diffusers version. "
-        "Please update diffusers or use a compatible train script."
+        "Could not initialize a trainable LoRAAttnProcessor with this diffusers version. "
+        "Please update diffusers (recommended >=0.20) or pin to a known compatible version."
     )
 
 
@@ -124,45 +191,14 @@ def collect_trainable_lora_parameters(unet: UNet2DConditionModel) -> list[Parame
     params: list[Parameter] = []
     seen_param_ids: set[int] = set()
 
-    def add_param(param: Parameter) -> None:
-        if id(param) in seen_param_ids:
-            return
-        if not param.requires_grad:
-            param.requires_grad_(True)
-        seen_param_ids.add(id(param))
-        params.append(param)
-
-    def walk(obj: Any, seen_obj_ids: set[int]) -> None:
-        obj_id = id(obj)
-        if obj_id in seen_obj_ids:
-            return
-        seen_obj_ids.add(obj_id)
-
-        if isinstance(obj, Parameter):
-            add_param(obj)
-            return
-
-        if isinstance(obj, torch.nn.Module):
-            for p in obj.parameters():
-                add_param(p)
-            return
-
-        if isinstance(obj, dict):
-            for v in obj.values():
-                walk(v, seen_obj_ids)
-            return
-
-        if isinstance(obj, (list, tuple, set)):
-            for v in obj:
-                walk(v, seen_obj_ids)
-            return
-
-        if hasattr(obj, "__dict__"):
-            for v in vars(obj).values():
-                walk(v, seen_obj_ids)
-
     for processor in unet.attn_processors.values():
-        walk(processor, seen_obj_ids=set())
+        for param in extract_parameters_from_object(processor):
+            if id(param) in seen_param_ids:
+                continue
+            if not param.requires_grad:
+                param.requires_grad_(True)
+            seen_param_ids.add(id(param))
+            params.append(param)
 
     if params:
         return params
