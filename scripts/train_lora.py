@@ -14,10 +14,10 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
 from PIL import Image
 from torch.optim import AdamW
+from torch.nn import Parameter
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
@@ -119,7 +119,25 @@ def build_lora_attn_processor(hidden_size: int, cross_attention_dim: int | None,
     )
 
 
-def make_lora_layers(unet: UNet2DConditionModel, rank: int) -> AttnProcsLayers:
+def collect_trainable_lora_parameters(unet: UNet2DConditionModel) -> list[Parameter]:
+    params: list[Parameter] = []
+
+    for processor in unet.attn_processors.values():
+        if isinstance(processor, torch.nn.Module):
+            params.extend([p for p in processor.parameters() if p.requires_grad])
+
+    if params:
+        return params
+
+    for name, param in unet.named_parameters():
+        if "lora" in name.lower():
+            param.requires_grad_(True)
+            params.append(param)
+
+    return params
+
+
+def make_lora_layers(unet: UNet2DConditionModel, rank: int) -> list[Parameter]:
     lora_attn_procs = {}
     for name in unet.attn_processors.keys():
         cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
@@ -142,7 +160,13 @@ def make_lora_layers(unet: UNet2DConditionModel, rank: int) -> AttnProcsLayers:
         )
 
     unet.set_attn_processor(lora_attn_procs)
-    return AttnProcsLayers(unet.attn_processors)
+    trainable_params = collect_trainable_lora_parameters(unet)
+    if not trainable_params:
+        raise RuntimeError(
+            "No trainable LoRA parameters were found after setting attention processors. "
+            "Install a compatible diffusers version (recommended >=0.20)."
+        )
+    return trainable_params
 
 
 def save_metrics(metrics: list[tuple[int, float, float]], output_dir: Path) -> None:
@@ -222,14 +246,13 @@ def main() -> None:
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
 
-    lora_layers = make_lora_layers(unet, rank=args.rank)
+    lora_parameters = make_lora_layers(unet, rank=args.rank)
 
     vae.to(device)
     text_encoder.to(device)
     unet.to(device)
 
-    lora_layers.to(device)
-    optimizer = AdamW(lora_layers.parameters(), lr=args.learning_rate)
+    optimizer = AdamW(lora_parameters, lr=args.learning_rate)
 
     print("[info] Loading dataset...")
     train_dataset = KanjiDataset(
