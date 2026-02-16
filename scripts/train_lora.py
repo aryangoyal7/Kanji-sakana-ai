@@ -9,6 +9,7 @@ import json
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import torch
@@ -121,10 +122,47 @@ def build_lora_attn_processor(hidden_size: int, cross_attention_dim: int | None,
 
 def collect_trainable_lora_parameters(unet: UNet2DConditionModel) -> list[Parameter]:
     params: list[Parameter] = []
+    seen_param_ids: set[int] = set()
+
+    def add_param(param: Parameter) -> None:
+        if id(param) in seen_param_ids:
+            return
+        if not param.requires_grad:
+            param.requires_grad_(True)
+        seen_param_ids.add(id(param))
+        params.append(param)
+
+    def walk(obj: Any, seen_obj_ids: set[int]) -> None:
+        obj_id = id(obj)
+        if obj_id in seen_obj_ids:
+            return
+        seen_obj_ids.add(obj_id)
+
+        if isinstance(obj, Parameter):
+            add_param(obj)
+            return
+
+        if isinstance(obj, torch.nn.Module):
+            for p in obj.parameters():
+                add_param(p)
+            return
+
+        if isinstance(obj, dict):
+            for v in obj.values():
+                walk(v, seen_obj_ids)
+            return
+
+        if isinstance(obj, (list, tuple, set)):
+            for v in obj:
+                walk(v, seen_obj_ids)
+            return
+
+        if hasattr(obj, "__dict__"):
+            for v in vars(obj).values():
+                walk(v, seen_obj_ids)
 
     for processor in unet.attn_processors.values():
-        if isinstance(processor, torch.nn.Module):
-            params.extend([p for p in processor.parameters() if p.requires_grad])
+        walk(processor, seen_obj_ids=set())
 
     if params:
         return params
