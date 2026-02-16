@@ -95,6 +95,30 @@ def collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     }
 
 
+def build_lora_attn_processor(hidden_size: int, cross_attention_dim: int | None, rank: int):
+    # Diffusers changed LoRAAttnProcessor constructor across versions.
+    for ctor in (
+        lambda: LoRAAttnProcessor(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            rank=rank,
+        ),
+        lambda: LoRAAttnProcessor(hidden_size, cross_attention_dim, rank),
+        lambda: LoRAAttnProcessor(hidden_size, cross_attention_dim),
+        lambda: LoRAAttnProcessor(rank),
+        lambda: LoRAAttnProcessor(),
+    ):
+        try:
+            return ctor()
+        except TypeError:
+            continue
+
+    raise TypeError(
+        "Could not initialize LoRAAttnProcessor with this diffusers version. "
+        "Please update diffusers or use a compatible train script."
+    )
+
+
 def make_lora_layers(unet: UNet2DConditionModel, rank: int) -> AttnProcsLayers:
     lora_attn_procs = {}
     for name in unet.attn_processors.keys():
@@ -111,7 +135,7 @@ def make_lora_layers(unet: UNet2DConditionModel, rank: int) -> AttnProcsLayers:
         else:
             raise ValueError(f"Unexpected attention processor name: {name}")
 
-        lora_attn_procs[name] = LoRAAttnProcessor(
+        lora_attn_procs[name] = build_lora_attn_processor(
             hidden_size=hidden_size,
             cross_attention_dim=cross_attention_dim,
             rank=rank,
