@@ -1,0 +1,12 @@
+torch>=2.1.0
+torchvision>=0.16.0
+diffusers>=0.31.0
+transformers>=4.44.0
+accelerate>=0.34.0
+safetensors>=0.4.4
+huggingface_hub>=0.24.0
+pillow>=10.4.0
+cairosvg>=2.7.1
+matplotlib>=3.8.4
+tensorboard>=2.16.2
+tqdm>=4.66.5

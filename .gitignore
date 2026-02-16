@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Training assets / artifacts
+checkpoints/
+data/
+logs/
+outputs/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
