@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-from diffusers.models.attention_processor import LoRAAttnProcessor
+from diffusers.models import attention_processor as attn_proc
 from PIL import Image
 from torch.optim import AdamW
 from torch.nn import Parameter
@@ -141,49 +141,76 @@ def extract_parameters_from_object(obj: Any) -> list[Parameter]:
     return params
 
 
-def build_lora_attn_processor(hidden_size: int, cross_attention_dim: int | None, rank: int):
-    # Diffusers changed LoRAAttnProcessor constructor across versions.
-    sig = inspect.signature(LoRAAttnProcessor.__init__)
-    param_names = set(sig.parameters.keys())
-
+def _instantiate_lora_cls(lora_cls: type, hidden_size: int, cross_attention_dim: int | None, rank: int):
+    sig = inspect.signature(lora_cls.__init__)
+    names = set(sig.parameters.keys())
     kw = {}
-    if "hidden_size" in param_names:
+    if "hidden_size" in names:
         kw["hidden_size"] = hidden_size
-    if "cross_attention_dim" in param_names:
+    if "cross_attention_dim" in names:
         kw["cross_attention_dim"] = cross_attention_dim
-    if "rank" in param_names:
+    if "rank" in names:
         kw["rank"] = rank
-    elif "r" in param_names:
+    elif "r" in names:
         kw["r"] = rank
-    if "network_alpha" in param_names:
+    if "network_alpha" in names:
         kw["network_alpha"] = rank
-    elif "lora_alpha" in param_names:
+    elif "lora_alpha" in names:
         kw["lora_alpha"] = rank
+    if "attention_op" in names:
+        kw["attention_op"] = None
 
-    constructors = []
-    if kw:
-        constructors.append(lambda: LoRAAttnProcessor(**kw))
+    return lora_cls(**kw)
 
-    constructors.extend(
+
+def _candidate_lora_class_names(base_processor: Any) -> list[str]:
+    base_name = base_processor.__class__.__name__
+    candidates: list[str] = []
+
+    if "AddedKV" in base_name:
+        candidates.append("LoRAAttnAddedKVProcessor")
+    if "XFormers" in base_name:
+        candidates.append("LoRAXFormersAttnProcessor")
+    if hasattr(F, "scaled_dot_product_attention"):
+        candidates.append("LoRAAttnProcessor2_0")
+
+    candidates.extend(
         [
-            lambda: LoRAAttnProcessor(hidden_size, cross_attention_dim, rank),
-            lambda: LoRAAttnProcessor(cross_attention_dim, hidden_size, rank),
-            lambda: LoRAAttnProcessor(hidden_size, cross_attention_dim),
-            lambda: LoRAAttnProcessor(cross_attention_dim, hidden_size),
+            "LoRAAttnProcessor",
+            "LoRAAttnProcessor2_0",
+            "LoRAAttnAddedKVProcessor",
+            "LoRAXFormersAttnProcessor",
         ]
     )
 
-    for ctor in constructors:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in candidates:
+        if name not in seen:
+            ordered.append(name)
+            seen.add(name)
+    return ordered
+
+
+def build_lora_attn_processor(
+    base_processor: Any, hidden_size: int, cross_attention_dim: int | None, rank: int
+):
+    errors: list[str] = []
+    for cls_name in _candidate_lora_class_names(base_processor):
+        lora_cls = getattr(attn_proc, cls_name, None)
+        if lora_cls is None:
+            continue
         try:
-            processor = ctor()
+            processor = _instantiate_lora_cls(lora_cls, hidden_size, cross_attention_dim, rank)
             if extract_parameters_from_object(processor):
                 return processor
-        except TypeError:
-            continue
+            errors.append(f"{cls_name}: no trainable params")
+        except Exception as exc:
+            errors.append(f"{cls_name}: {exc}")
 
     raise TypeError(
-        "Could not initialize a trainable LoRAAttnProcessor with this diffusers version. "
-        "Please update diffusers (recommended >=0.20) or pin to a known compatible version."
+        "Could not initialize a trainable LoRA attention processor with this diffusers version. "
+        f"Tried: {', '.join(errors[:6])}"
     )
 
 
@@ -213,7 +240,7 @@ def collect_trainable_lora_parameters(unet: UNet2DConditionModel) -> list[Parame
 
 def make_lora_layers(unet: UNet2DConditionModel, rank: int) -> list[Parameter]:
     lora_attn_procs = {}
-    for name in unet.attn_processors.keys():
+    for name, base_processor in unet.attn_processors.items():
         cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
 
         if name.startswith("mid_block"):
@@ -228,6 +255,7 @@ def make_lora_layers(unet: UNet2DConditionModel, rank: int) -> list[Parameter]:
             raise ValueError(f"Unexpected attention processor name: {name}")
 
         lora_attn_procs[name] = build_lora_attn_processor(
+            base_processor=base_processor,
             hidden_size=hidden_size,
             cross_attention_dim=cross_attention_dim,
             rank=rank,
